@@ -4737,6 +4737,15 @@ static void start_update_check(cbm_mcp_server_t *srv) {
     if (srv->update_checked) {
         return;
     }
+    /* Opt-out: skip the GitHub version check entirely for restricted-egress or
+     * air-gapped environments. Set CBM_NO_UPDATE_CHECK=1 to disable. */
+    char optout_buf[8];
+    const char *optout =
+        cbm_safe_getenv("CBM_NO_UPDATE_CHECK", optout_buf, sizeof(optout_buf), NULL);
+    if (optout && strcmp(optout, "1") == 0) {
+        srv->update_checked = true; /* mark done so we never launch the thread */
+        return;
+    }
     srv->update_checked = true; /* prevent double-launch */
     if (cbm_thread_create(&srv->update_tid, 0, update_check_thread, srv) == 0) {
         srv->update_thread_active = true;

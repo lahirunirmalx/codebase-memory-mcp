@@ -3898,8 +3898,27 @@ static int download_verify_install(const char *url, const char *ext, const char 
              want_ui ? "ui-" : "", os, arch, portable, ext);
     int crc = verify_download_checksum(tmp_archive, archive_name);
     if (crc == CLI_TRUE) {
+        /* Explicit checksum mismatch: the binary is tampered or corrupt. Never install. */
         cbm_unlink(tmp_archive);
         return CLI_TRUE;
+    }
+    if (crc != 0) {
+        /* "Could not verify" (missing checksums.txt, name absent, or no sha256 tool).
+         * Fail closed: do not install an unverified binary. An operator on an
+         * isolated/offline host may opt in explicitly via CBM_ALLOW_UNVERIFIED_UPDATE=1. */
+        char allow_buf[CLI_BUF_16];
+        const char *allow =
+            cbm_safe_getenv("CBM_ALLOW_UNVERIFIED_UPDATE", allow_buf, sizeof(allow_buf), NULL);
+        if (!allow || strcmp(allow, "1") != 0) {
+            (void)fprintf(stderr,
+                          "error: could not verify the downloaded binary - aborting.\n"
+                          "  Verification is required by default. To override on an offline host, "
+                          "set CBM_ALLOW_UNVERIFIED_UPDATE=1.\n");
+            cbm_unlink(tmp_archive);
+            return CLI_TRUE;
+        }
+        (void)fprintf(stderr, "warning: installing UNVERIFIED binary "
+                              "(CBM_ALLOW_UNVERIFIED_UPDATE=1).\n");
     }
 
     int killed = cbm_kill_other_instances();

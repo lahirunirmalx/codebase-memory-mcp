@@ -38,6 +38,8 @@ content_type_for() {
         *.ico)  echo "image/x-icon" ;;
         *.woff2) echo "font/woff2" ;;
         *.woff) echo "font/woff" ;;
+        *.ttf)  echo "font/ttf" ;;
+        *.otf)  echo "font/otf" ;;
         *.map)  echo "application/json" ;;
         *)      echo "application/octet-stream" ;;
     esac

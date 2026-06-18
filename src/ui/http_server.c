@@ -105,6 +105,25 @@ typedef struct {
 
 static index_job_t g_index_jobs[MAX_INDEX_JOBS];
 
+/* Content-Security-Policy for the UI document. The loopback server and its
+ * embedded assets are entirely self-contained, so every fetch directive is
+ * pinned to 'self'. This makes the browser refuse any external request -
+ * fonts, scripts, XHR/fetch/WebSocket, images - so viewing a proprietary
+ * codebase in the graph UI cannot leak data to any third-party host.
+ * script/style allow 'unsafe-inline'/'unsafe-eval' and worker allows blob:
+ * because the bundled React + three.js/troika stack needs them; none of those
+ * widen network egress, which is governed by connect-src/font-src/img-src. */
+/* Note on blob: in script-src - three.js/troika build Web Workers from blob:
+ * URLs and those workers call importScripts(blob:...), which is governed by
+ * script-src (script-src-elem falls back to it), not worker-src. blob: is a
+ * local, same-origin scheme and does NOT permit any network egress; egress is
+ * still fully pinned by connect-src/font-src/img-src 'self'. */
+#define CBM_UI_CSP                                                                                 \
+    "Content-Security-Policy: default-src 'self'; connect-src 'self'; font-src 'self'; "           \
+    "img-src 'self' data: blob:; media-src 'self' data: blob:; "                                   \
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; "    \
+    "worker-src 'self' blob:; object-src 'none'; base-uri 'self'\r\n"
+
 /* ── Serve embedded asset ─────────────────────────────────────── */
 
 static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
@@ -1304,9 +1323,9 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     if (cbm_http_path_match(req->path, "/")) {
         const cbm_embedded_file_t *f = cbm_embedded_lookup("/index.html");
         if (f) {
-            char html_hdrs[512];
+            char html_hdrs[1024];
             snprintf(html_hdrs, sizeof(html_hdrs),
-                     "%sContent-Type: text/html\r\nCache-Control: no-cache\r\n", g_cors);
+                     "%sContent-Type: text/html\r\nCache-Control: no-cache\r\n" CBM_UI_CSP, g_cors);
             cbm_http_reply_buf(c, 200, html_hdrs, f->data, (size_t)f->size);
             return;
         }

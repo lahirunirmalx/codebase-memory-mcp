@@ -89,9 +89,16 @@ ifeq ($(STATIC),1)
 STATIC_FLAGS := -static
 endif
 
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS)
-LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
-LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(LIBGIT2_LIBS) $(WIN32_LIBS)
+# libdl: SQLite's dlopen/dlsym live in a separate libdl on glibc < 2.34.
+# Linked on non-Windows (harmless stub on glibc >= 2.34 and macOS); MinGW has no libdl.
+DL_LIBS :=
+ifneq ($(IS_MINGW),yes)
+DL_LIBS := -ldl
+endif
+
+LDFLAGS = -lm -lstdc++ -lpthread -lz $(DL_LIBS) $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS)
+LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(DL_LIBS) $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
+LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(DL_LIBS) -fsanitize=thread $(LIBGIT2_LIBS) $(WIN32_LIBS)
 
 # ── Source files ─────────────────────────────────────────────────
 
