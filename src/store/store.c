@@ -2348,12 +2348,36 @@ static int search_where_basic(const cbm_search_params_t *params, char *where, in
         *wlen = where_append(where, where_sz, *wlen, nparams, bind_buf);
         where_bind_text(binds, bind_idx, params->project);
     }
-    /* Ignore an empty-string label: it is non-NULL but should behave like an
-     * omitted label (no filter), matching the BM25 query path. Without the
-     * params->label[0] guard, name_pattern/qn_pattern searches that pass
-     * label="" append `n.label = ''`, which matches no node and silently
-     * returns zero results (issue #481). */
-    if (params->label && params->label[0]) {
+    if (params->include_labels && params->include_labels[0]) {
+        /* n.label IN (?,?,...) - one bind per whitelisted label. Track the write
+         * offset as a clamped size_t so the remaining-size passed to snprintf can
+         * never underflow, even on truncation (snprintf returns the would-be
+         * length, which may exceed the buffer). */
+        char in_buf[CBM_SZ_256];
+        const size_t cap = sizeof(in_buf);
+        int head = snprintf(in_buf, cap, "n.label IN (");
+        size_t off = (head > 0) ? (size_t)head : 0;
+        if (off >= cap)
+            off = cap - 1;
+        int base = *bind_idx;
+        int k = 0;
+        for (; k < ST_SEARCH_MAX_BINDS && params->include_labels[k]; k++) {
+            int w = snprintf(in_buf + off, cap - off, "%s?%d", k ? "," : "", base + SKIP_ONE + k);
+            if (w < 0)
+                break;
+            off += (size_t)w;
+            if (off >= cap) { /* truncated: stop before the size could underflow */
+                off = cap - 1;
+                break;
+            }
+        }
+        snprintf(in_buf + off, cap - off, ")");
+        *wlen = where_append(where, where_sz, *wlen, nparams, in_buf);
+        for (int i = 0; i < k; i++)
+            where_bind_text(binds, bind_idx, params->include_labels[i]);
+    } else if (params->label && params->label[0]) {
+        /* Ignore an empty-string label (issue #481): non-NULL but behaves like an
+         * omitted label, matching the BM25 query path. */
         snprintf(bind_buf, sizeof(bind_buf), "n.label = ?%d", *bind_idx + SKIP_ONE);
         *wlen = where_append(where, where_sz, *wlen, nparams, bind_buf);
         where_bind_text(binds, bind_idx, params->label);
@@ -2563,6 +2587,201 @@ void cbm_store_search_free(cbm_search_output_t *out) {
     }
     free(out->results);
     memset(out, 0, sizeof(*out));
+}
+
+/* ── Hierarchy expansion (semantic-zoom drill-down) ─────────────────── */
+
+void cbm_tree_view_free(cbm_tree_view_t *v) {
+    if (!v) {
+        return;
+    }
+    for (int i = 0; i < v->child_count; i++) {
+        free(v->children[i].name);
+        free(v->children[i].full_qn);
+        free(v->children[i].kind);
+    }
+    free(v->children);
+    free(v->edges);
+    memset(v, 0, sizeof(*v));
+}
+
+/* SQL fragment: the QN segment of column `col` immediately after the bound
+ * prefix (param ?2 = length of "prefix."). Reused in the child-grouping and
+ * edge-aggregation queries. SUBSTR(col, ?2 + 1) is the remainder after the
+ * prefix; the first dotted token of that remainder is the child segment. */
+#define CBM_TREE_SEG(col)                                                                    \
+    "CASE WHEN INSTR(SUBSTR(" col ", ?2 + 1), '.') > 0 "                                     \
+    "     THEN SUBSTR(SUBSTR(" col ", ?2 + 1), 1, INSTR(SUBSTR(" col ", ?2 + 1), '.') - 1) " \
+    "     ELSE SUBSTR(" col ", ?2 + 1) END"
+
+static int tree_child_index(const cbm_tree_view_t *v, const char *name) {
+    for (int i = 0; i < v->child_count; i++) {
+        if (strcmp(v->children[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return CBM_NOT_FOUND;
+}
+
+int cbm_store_expand_tree(cbm_store_t *s, const char *project, const char *prefix, int child_limit,
+                          int edge_limit, cbm_tree_view_t *out) {
+    if (!s || !s->db || !project || !prefix || !out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    if (child_limit <= 0) {
+        child_limit = 500;
+    }
+    if (edge_limit <= 0) {
+        edge_limit = 2000;
+    }
+
+    size_t plen = strlen(prefix);
+    /* Range bounds so the (project, qualified_name) index can prefix-scan:
+     * every child QN is "prefix" + "." + ..., and '.' (0x2E) < '/' (0x2F), so
+     * [prefix+".", prefix+"/") is exactly the set of descendants. This replaces a
+     * non-sargable SUBSTR(...) = ? predicate that forced a full table scan. */
+    char *lo = malloc(plen + 2);
+    char *hi = malloc(plen + 2);
+    if (!lo || !hi) {
+        free(lo);
+        free(hi);
+        return CBM_STORE_ERR;
+    }
+    memcpy(lo, prefix, plen);
+    lo[plen] = '.';
+    lo[plen + 1] = '\0';
+    memcpy(hi, prefix, plen);
+    hi[plen] = '/';
+    hi[plen + 1] = '\0';
+    int substr_len = (int)plen + 1; /* offset of the segment after "prefix." */
+
+    /* 1. Children: group nodes one level below `prefix` by their next QN segment. */
+    const char *child_sql = "SELECT " CBM_TREE_SEG(
+        "qualified_name") " AS child, COUNT(*) AS cnt, "
+                          "MAX(CASE WHEN INSTR(SUBSTR(qualified_name, ?2 + 1), '.') > 0 "
+                          "         THEN 1 ELSE 0 END) AS expandable, "
+                          "MAX(CASE WHEN INSTR(SUBSTR(qualified_name, ?2 + 1), '.') = 0 "
+                          "         THEN label END) AS kind "
+                          "FROM nodes WHERE project = ?1 "
+                          "AND qualified_name >= ?3 AND qualified_name < ?4 "
+                          "GROUP BY child ORDER BY cnt DESC LIMIT ?5";
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, child_sql, CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
+        free(lo);
+        free(hi);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(st, 1, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    sqlite3_bind_int(st, 2, substr_len);
+    sqlite3_bind_text(st, 3, lo, CBM_NOT_FOUND, SQLITE_STATIC);
+    sqlite3_bind_text(st, 4, hi, CBM_NOT_FOUND, SQLITE_STATIC);
+    sqlite3_bind_int(st, 5, child_limit);
+
+    int cap = 16, n = 0;
+    cbm_tree_child_t *children = malloc((size_t)cap * sizeof(*children));
+    if (!children) {
+        sqlite3_finalize(st);
+        free(lo);
+        free(hi);
+        return CBM_STORE_ERR;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *child = (const char *)sqlite3_column_text(st, 0);
+        if (!child || child[0] == '\0') {
+            continue;
+        }
+        if (n >= cap) {
+            cap *= 2;
+            cbm_tree_child_t *tmp = realloc(children, (size_t)cap * sizeof(*children));
+            if (!tmp) {
+                break;
+            }
+            children = tmp;
+        }
+        const char *kind = (const char *)sqlite3_column_text(st, 3);
+        size_t clen = strlen(child);
+        char *fq = malloc(plen + 1 + clen + 1);
+        if (fq) {
+            memcpy(fq, prefix, plen);
+            fq[plen] = '.';
+            memcpy(fq + plen + 1, child, clen + 1);
+        }
+        children[n].name = heap_strdup(child);
+        children[n].full_qn = fq;
+        children[n].kind = heap_strdup(kind ? kind : "Group");
+        children[n].count = sqlite3_column_int(st, 1);
+        children[n].expandable = sqlite3_column_int(st, 2);
+        n++;
+    }
+    sqlite3_finalize(st);
+    out->children = children;
+    out->child_count = n;
+    if (n == 0) {
+        free(lo);
+        free(hi);
+        return CBM_STORE_OK;
+    }
+
+    /* 2. Edges: aggregate cross-child relationship edges into weighted super-edges.
+     * Drive from the (project, qualified_name) index range on each endpoint so the
+     * planner restricts to the current subtree before the COUNT/GROUP, instead of
+     * scanning every typed edge in the project. */
+    const char *edge_sql = "SELECT " CBM_TREE_SEG("ns.qualified_name") " AS src, " CBM_TREE_SEG(
+        "nt.qualified_name") " AS tgt, COUNT(*) AS w "
+                             "FROM edges e JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON "
+                             "nt.id = e.target_id "
+                             "WHERE e.project = ?1 AND e.type IN "
+                             "('CALLS','IMPORTS','INHERITS','USAGE','WRITES','CONFIGURES','HTTP_"
+                             "CALLS','THROWS') "
+                             "AND ns.qualified_name >= ?3 AND ns.qualified_name < ?4 "
+                             "AND nt.qualified_name >= ?3 AND nt.qualified_name < ?4 "
+                             "AND " CBM_TREE_SEG("ns.qualified_name") " <> " CBM_TREE_SEG(
+                                 "nt.qualified_name") " "
+                                                      "GROUP BY src, tgt ORDER BY w DESC LIMIT ?5";
+
+    if (sqlite3_prepare_v2(s->db, edge_sql, CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
+        free(lo);
+        free(hi);
+        return CBM_STORE_OK; /* children are still valid */
+    }
+    sqlite3_bind_text(st, 1, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    sqlite3_bind_int(st, 2, substr_len);
+    sqlite3_bind_text(st, 3, lo, CBM_NOT_FOUND, SQLITE_STATIC);
+    sqlite3_bind_text(st, 4, hi, CBM_NOT_FOUND, SQLITE_STATIC);
+    sqlite3_bind_int(st, 5, edge_limit);
+
+    int ecap = 32, en = 0;
+    cbm_tree_edge_t *edges = malloc((size_t)ecap * sizeof(*edges));
+    while (edges && sqlite3_step(st) == SQLITE_ROW) {
+        const char *sc = (const char *)sqlite3_column_text(st, 0);
+        const char *tc = (const char *)sqlite3_column_text(st, 1);
+        int si = sc ? tree_child_index(out, sc) : CBM_NOT_FOUND;
+        int di = tc ? tree_child_index(out, tc) : CBM_NOT_FOUND;
+        if (si < 0 || di < 0) {
+            continue; /* endpoint truncated by child_limit */
+        }
+        if (en >= ecap) {
+            ecap *= 2;
+            cbm_tree_edge_t *tmp = realloc(edges, (size_t)ecap * sizeof(*edges));
+            if (!tmp) {
+                break;
+            }
+            edges = tmp;
+        }
+        edges[en].src = si;
+        edges[en].dst = di;
+        edges[en].weight = sqlite3_column_int(st, 2);
+        en++;
+    }
+    sqlite3_finalize(st);
+    out->edges = edges;
+    out->edge_count = en;
+
+    free(lo);
+    free(hi);
+    return CBM_STORE_OK;
 }
 
 /* ── BFS Traversal ──────────────────────────────────────────────── */

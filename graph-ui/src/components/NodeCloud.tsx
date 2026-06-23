@@ -55,7 +55,9 @@ export function NodeCloud({
       const n = nodes[i];
       tempObj.position.set(n.x, n.y, n.z);
       const isHighlighted = !hasHighlight || highlightedIds.has(n.id);
-      const s = n.size * (isHighlighted ? 0.5 : 0.2);
+      /* Larger solid spheres so the clickable geometry roughly matches the
+       * bloom glow - clicking the visible halo previously missed the tiny core. */
+      const s = n.size * (isHighlighted ? 0.9 : 0.35);
       tempObj.scale.set(s, s, s);
       tempObj.updateMatrix();
       mesh.setMatrixAt(i, tempObj.matrix);

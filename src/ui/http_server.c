@@ -118,10 +118,10 @@ static index_job_t g_index_jobs[MAX_INDEX_JOBS];
  * script-src (script-src-elem falls back to it), not worker-src. blob: is a
  * local, same-origin scheme and does NOT permit any network egress; egress is
  * still fully pinned by connect-src/font-src/img-src 'self'. */
-#define CBM_UI_CSP                                                                                 \
-    "Content-Security-Policy: default-src 'self'; connect-src 'self'; font-src 'self'; "           \
-    "img-src 'self' data: blob:; media-src 'self' data: blob:; "                                   \
-    "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; "    \
+#define CBM_UI_CSP                                                                              \
+    "Content-Security-Policy: default-src 'self'; connect-src 'self'; font-src 'self'; "        \
+    "img-src 'self' data: blob:; media-src 'self' data: blob:; "                                \
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; " \
     "worker-src 'self' blob:; object-src 'none'; base-uri 'self'\r\n"
 
 /* ── Serve embedded asset ─────────────────────────────────────── */
@@ -995,6 +995,14 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             max_nodes = v;
     }
 
+    /* Optional label filter. Empty string ("label=") explicitly means "all labels";
+     * an absent param keeps the default. */
+    char label[64] = {0};
+    const char *label_filter = NULL;
+    if (cbm_http_query_param(req->query, "label", label, (int)sizeof(label))) {
+        label_filter = label[0] != '\0' ? label : NULL;
+    }
+
     char db_path[1024];
     db_path_for_project(project, db_path, sizeof(db_path));
 
@@ -1010,7 +1018,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 
     cbm_layout_result_t *layout =
-        cbm_layout_compute(store, project, CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes);
+        cbm_layout_compute(store, project, CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes, label_filter);
 
     /* Find linked projects from CROSS_* edges. Keep `store` open through the
      * linked-projects loop below so we can resolve target Route QNs against
@@ -1073,8 +1081,8 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         }
 
         /* Keep lp_store open through cross_edges resolution below. */
-        cbm_layout_result_t *lp_layout =
-            cbm_layout_compute(lp_store, linked[li], CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes);
+        cbm_layout_result_t *lp_layout = cbm_layout_compute(
+            lp_store, linked[li], CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes, label_filter);
 
         if (!lp_layout) {
             cbm_store_close(lp_store);
@@ -1209,6 +1217,186 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 }
 
+/* Color for an aggregated container super-node, keyed by its dominant node label. */
+static uint32_t tree_kind_color(const char *kind) {
+    if (!kind)
+        return 0x8888aa;
+    if (strcmp(kind, "Folder") == 0)
+        return 0xf2c14e;
+    if (strcmp(kind, "File") == 0)
+        return 0x4ea8de;
+    if (strcmp(kind, "Class") == 0)
+        return 0x9b5de5;
+    if (strcmp(kind, "Interface") == 0)
+        return 0xc77dff;
+    if (strcmp(kind, "Method") == 0)
+        return 0x00bbf9;
+    if (strcmp(kind, "Function") == 0)
+        return 0x00f5d4;
+    if (strcmp(kind, "Module") == 0)
+        return 0xff8fab;
+    if (strcmp(kind, "Variable") == 0)
+        return 0xfee440;
+    if (strcmp(kind, "Route") == 0)
+        return 0xff5d8f;
+    if (strcmp(kind, "Enum") == 0 || strcmp(kind, "Type") == 0)
+        return 0x90be6d;
+    return 0x8888aa; /* Group / unknown */
+}
+
+/* Memo cache for /api/graph. The aggregation over a large subtree scans many
+ * edges (~seconds at the root), but the index is static while the server runs,
+ * so each (project,parent) view is computed once and reused. The HTTP server is
+ * single-threaded per request (see httpd.c), so no locking is needed. */
+#define GRAPH_CACHE_MAX 64
+static struct {
+    char *key;
+    char *json;
+} g_graph_cache[GRAPH_CACHE_MAX];
+static int g_graph_cache_n = 0;
+static int g_graph_cache_next = 0; /* FIFO eviction cursor when full */
+
+static const char *graph_cache_get(const char *key) {
+    for (int i = 0; i < g_graph_cache_n; i++) {
+        if (g_graph_cache[i].key && strcmp(g_graph_cache[i].key, key) == 0) {
+            return g_graph_cache[i].json;
+        }
+    }
+    return NULL;
+}
+
+static void graph_cache_put(const char *key, const char *json) {
+    char *kd = strdup(key);
+    char *jd = strdup(json);
+    if (!kd || !jd) {
+        free(kd);
+        free(jd);
+        return;
+    }
+    int slot;
+    if (g_graph_cache_n < GRAPH_CACHE_MAX) {
+        slot = g_graph_cache_n++;
+    } else {
+        slot = g_graph_cache_next;
+        g_graph_cache_next = (g_graph_cache_next + 1) % GRAPH_CACHE_MAX;
+        free(g_graph_cache[slot].key);
+        free(g_graph_cache[slot].json);
+    }
+    g_graph_cache[slot].key = kd;
+    g_graph_cache[slot].json = jd;
+}
+
+/* GET /api/graph?project=X&parent=<qn> — one hierarchy level for the drill-down
+ * explorer: aggregated container children + weighted cross-container super-edges.
+ * `parent` defaults to the project root. Memory-safe for any repo size: only the
+ * (capped) children + super-edges are materialized, never the full graph. */
+static void handle_graph(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    char parent[1024] = {0};
+    if (!cbm_http_query_param(req->query, "project", project, (int)sizeof(project)) ||
+        project[0] == '\0') {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing project parameter\"}");
+        return;
+    }
+    /* Root = the project node, whose qualified_name equals the project name. */
+    if (!cbm_http_query_param(req->query, "parent", parent, (int)sizeof(parent)) ||
+        parent[0] == '\0') {
+        snprintf(parent, sizeof(parent), "%s", project);
+    }
+
+    /* Cache key = project + '\n' + parent. */
+    char cache_key[1300];
+    snprintf(cache_key, sizeof(cache_key), "%s\n%s", project, parent);
+    const char *cached = graph_cache_get(cache_key);
+    if (cached) {
+        cbm_http_replyf(c, 200, g_cors_json, "%s", cached);
+        return;
+    }
+
+    char db_path[1024];
+    db_path_for_project(project, db_path, sizeof(db_path));
+    if (!cbm_file_exists(db_path)) {
+        cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+        return;
+    }
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
+        return;
+    }
+
+    cbm_tree_view_t view;
+    if (cbm_store_expand_tree(store, project, parent, 500, 2000, &view) != CBM_STORE_OK) {
+        cbm_store_close(store);
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"expand failed\"}");
+        return;
+    }
+
+    int n = view.child_count;
+    /* Spread nodes wider so they overlap less and present larger click targets. */
+    double radius = 90.0 + sqrt((double)(n > 0 ? n : 1)) * 26.0;
+    double golden = M_PI * (3.0 - sqrt(5.0));
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_val *na = yyjson_mut_arr(doc);
+    for (int i = 0; i < n; i++) {
+        cbm_tree_child_t *ch = &view.children[i];
+        yyjson_mut_val *nd = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, nd, "id", i);
+        /* Fibonacci sphere placement so the overview reads as a ball of nodes. */
+        double yy = n > 1 ? 1.0 - (i / (double)(n - 1)) * 2.0 : 0.0;
+        double rr = sqrt(1.0 - yy * yy);
+        double th = golden * i;
+        yyjson_mut_obj_add_real(doc, nd, "x", cos(th) * rr * radius);
+        yyjson_mut_obj_add_real(doc, nd, "y", yy * radius);
+        yyjson_mut_obj_add_real(doc, nd, "z", sin(th) * rr * radius);
+        yyjson_mut_obj_add_str(doc, nd, "label", ch->kind ? ch->kind : "Group");
+        yyjson_mut_obj_add_str(doc, nd, "name", ch->name ? ch->name : "");
+        double sz = 4.0 + log((double)(ch->count > 0 ? ch->count : 1) + 1.0) * 2.6;
+        yyjson_mut_obj_add_real(doc, nd, "size", sz);
+        char hex[16];
+        snprintf(hex, sizeof(hex), "#%06x", tree_kind_color(ch->kind));
+        yyjson_mut_obj_add_strcpy(doc, nd, "color", hex);
+        yyjson_mut_obj_add_int(doc, nd, "count", ch->count);
+        yyjson_mut_obj_add_bool(doc, nd, "expandable", ch->expandable != 0);
+        if (ch->full_qn) {
+            yyjson_mut_obj_add_strcpy(doc, nd, "qn", ch->full_qn);
+        }
+        yyjson_mut_arr_append(na, nd);
+    }
+    yyjson_mut_obj_add_val(doc, root, "nodes", na);
+
+    yyjson_mut_val *ea = yyjson_mut_arr(doc);
+    for (int i = 0; i < view.edge_count; i++) {
+        yyjson_mut_val *ed = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, ed, "source", view.edges[i].src);
+        yyjson_mut_obj_add_int(doc, ed, "target", view.edges[i].dst);
+        yyjson_mut_obj_add_str(doc, ed, "type", "AGG");
+        yyjson_mut_obj_add_int(doc, ed, "weight", view.edges[i].weight);
+        yyjson_mut_arr_append(ea, ed);
+    }
+    yyjson_mut_obj_add_val(doc, root, "edges", ea);
+    yyjson_mut_obj_add_int(doc, root, "total_nodes", n);
+    yyjson_mut_obj_add_strcpy(doc, root, "prefix", parent);
+
+    size_t len = 0;
+    char *json = yyjson_mut_write_opts(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL, &len, NULL);
+    yyjson_mut_doc_free(doc);
+    cbm_tree_view_free(&view);
+    cbm_store_close(store);
+
+    if (json) {
+        graph_cache_put(cache_key, json);
+        cbm_http_replyf(c, 200, g_cors_json, "%s", json);
+        free(json);
+    } else {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON write failed\"}");
+    }
+}
+
 /* ── Handle JSON-RPC request ──────────────────────────────────── */
 
 static void handle_rpc(cbm_http_conn_t *c, const cbm_http_req_t *req, cbm_mcp_server_t *mcp) {
@@ -1256,6 +1444,11 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* GET /api/layout → 3D graph layout */
     if (is_get && cbm_http_path_match(req->path, "/api/layout*")) {
         handle_layout(c, req);
+        return;
+    }
+
+    if (is_get && cbm_http_path_match(req->path, "/api/graph*")) {
+        handle_graph(c, req);
         return;
     }
 

@@ -5,16 +5,19 @@ interface UseGraphDataResult {
   data: GraphData | null;
   loading: boolean;
   error: string | null;
-  fetchOverview: (project: string) => void;
-  fetchDetail: (project: string, centerNode: string) => void;
+  /* Load one hierarchy level of the drill-down explorer. `parent` is a container
+   * qualified_name; omit (or pass the project) for the repo root. */
+  fetchGraph: (project: string, parent?: string) => void;
 }
 
-async function fetchLayout(
-  project: string,
-  maxNodes = 50000,
-): Promise<GraphData> {
-  const params = new URLSearchParams({ project, max_nodes: String(maxNodes) });
-  const res = await fetch(`/api/layout?${params}`);
+/* The drill-down explorer fetches aggregated container nodes + weighted
+ * super-edges from /api/graph. The backend only ever materializes the current
+ * level (a few hundred nodes), so this is memory-safe for any repo size -
+ * unlike /api/layout, which tried to lay out the whole graph and OOM'd. */
+async function fetchLevel(project: string, parent?: string): Promise<GraphData> {
+  const params = new URLSearchParams({ project });
+  if (parent) params.set("parent", parent);
+  const res = await fetch(`/api/graph?${params}`);
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
@@ -29,35 +32,18 @@ export function useGraphData(): UseGraphDataResult {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchOverview = useCallback(async (project: string) => {
+  const fetchGraph = useCallback(async (project: string, parent?: string) => {
     setLoading(true);
     setError(null);
     try {
-      const result = await fetchLayout(project, 50000);
+      const result = await fetchLevel(project, parent);
       setData(result);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch layout");
+      setError(e instanceof Error ? e.message : "Failed to load graph");
     } finally {
       setLoading(false);
     }
   }, []);
 
-  const fetchDetail = useCallback(
-    async (project: string, _centerNode: string) => {
-      setLoading(true);
-      setError(null);
-      try {
-        /* TODO: detail level with center_node filtering */
-        const result = await fetchLayout(project, 50000);
-        setData(result);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to fetch layout");
-      } finally {
-        setLoading(false);
-      }
-    },
-    [],
-  );
-
-  return { data, loading, error, fetchOverview, fetchDetail };
+  return { data, loading, error, fetchGraph };
 }

@@ -384,7 +384,7 @@ static int find_node_index(const node_id_entry_t *map, int count, int64_t id) {
 
 cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                                         cbm_layout_level_t level, const char *center_node,
-                                        int radius, int max_nodes) {
+                                        int radius, int max_nodes, const char *label) {
     if (!store || !project)
         return NULL;
     if (max_nodes <= 0)
@@ -400,11 +400,75 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     params.limit = max_nodes;
     params.min_degree = -1;
     params.max_degree = -1;
+    /* Optional label filter. Accepts a comma-separated whitelist (e.g.
+     * "Class,Method,Variable"); NULL/empty means all labels. */
+    char label_buf[CBM_SZ_256];
+    const char *label_ptrs[16];
+    int label_n = 0;
+    if (label && label[0] != '\0') {
+        snprintf(label_buf, sizeof(label_buf), "%s", label);
+        char *save = NULL;
+        for (char *tok = strtok_r(label_buf, ",", &save);
+             tok && label_n < (int)(sizeof(label_ptrs) / sizeof(label_ptrs[0])) - 1;
+             tok = strtok_r(NULL, ",", &save)) {
+            while (*tok == ' ')
+                tok++;
+            if (*tok != '\0')
+                label_ptrs[label_n++] = tok;
+        }
+    }
+    label_ptrs[label_n] = NULL;
+    params.include_labels = label_n > 0 ? label_ptrs : NULL;
 
     cbm_search_output_t search_out;
     memset(&search_out, 0, sizeof(search_out));
-    if (cbm_store_search(store, &params, &search_out) != CBM_STORE_OK)
+    if (label_n > 1) {
+        /* Multiple labels: give each its own quota so every requested type is
+         * represented. A flat "ORDER BY name LIMIT" lets one label (e.g. Variable)
+         * crowd out the rest. Run one search per label, then merge - transferring
+         * string ownership to the combined output (free only each sub's container
+         * array; cbm_store_search_free(&search_out) later frees the strings once). */
+        int per = max_nodes / label_n;
+        if (per < 1)
+            per = 1;
+        cbm_search_output_t subs[16];
+        int sub_count = 0;
+        int merged_cap = 0, merged_total = 0;
+        for (int li = 0; li < label_n; li++) {
+            const char *one[2] = {label_ptrs[li], NULL};
+            cbm_search_params_t p = params;
+            p.include_labels = one;
+            p.limit = per;
+            memset(&subs[sub_count], 0, sizeof(subs[0]));
+            if (cbm_store_search(store, &p, &subs[sub_count]) == CBM_STORE_OK) {
+                merged_cap += subs[sub_count].count;
+                merged_total += subs[sub_count].total;
+                sub_count++;
+            }
+        }
+        int merged_ok = 0;
+        if (merged_cap > 0) {
+            search_out.results = malloc((size_t)merged_cap * sizeof(cbm_search_result_t));
+            if (search_out.results) {
+                int idx = 0;
+                for (int s = 0; s < sub_count; s++)
+                    for (int i = 0; i < subs[s].count; i++)
+                        search_out.results[idx++] = subs[s].results[i];
+                search_out.count = merged_cap;
+                search_out.total = merged_total;
+                for (int s = 0; s < sub_count; s++)
+                    free(subs[s].results); /* container only; strings moved to search_out */
+                merged_ok = 1;
+            }
+        }
+        if (!merged_ok) {
+            for (int s = 0; s < sub_count; s++)
+                cbm_store_search_free(&subs[s]);
+            return calloc(CBM_ALLOC_ONE, sizeof(cbm_layout_result_t));
+        }
+    } else if (cbm_store_search(store, &params, &search_out) != CBM_STORE_OK) {
         return calloc(CBM_ALLOC_ONE, sizeof(cbm_layout_result_t));
+    }
 
     int n = search_out.count, total_count = search_out.total;
     if (n == 0) {

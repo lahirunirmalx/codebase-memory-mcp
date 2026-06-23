@@ -6,7 +6,7 @@ import {
   computeCameraTarget,
   type CameraTarget,
 } from "./GraphScene";
-import { Sidebar } from "./Sidebar";
+import { LevelList } from "./LevelList";
 import { FilterPanel } from "./FilterPanel";
 import { NodeDetailPanel } from "./NodeDetailPanel";
 import { ResizeHandle } from "./ResizeHandle";
@@ -29,10 +29,20 @@ interface GraphTabProps {
   project: string | null;
 }
 
+/* A breadcrumb in the drill-down path. qn is the container's qualified_name
+ * (passed to /api/graph as `parent`); name is the segment shown to the user. */
+interface Crumb {
+  qn: string;
+  name: string;
+}
+
 export function GraphTab({ project }: GraphTabProps) {
-  const { data, loading, error, fetchOverview } = useGraphData();
+  const { data, loading, error, fetchGraph } = useGraphData();
+  /* Drill-down path. crumbs[0] is the repo root; the last crumb is the
+   * currently displayed container. */
+  const [crumbs, setCrumbs] = useState<Crumb[]>([]);
   const [highlightedIds, setHighlightedIds] = useState<Set<number> | null>(null);
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [, setSelectedPath] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [cameraTarget, setCameraTarget] = useState<CameraTarget | null>(null);
   const [showLabels, setShowLabels] = useState(true);
@@ -87,35 +97,36 @@ export function GraphTab({ project }: GraphTabProps) {
     return { nodes, edges, total_nodes: data.total_nodes, linked_projects };
   }, [data, enabledLabels, enabledEdgeTypes]);
 
+  /* On project change, reset to the repo root (parent = project name). */
   useEffect(() => {
     if (project) {
-      fetchOverview(project);
+      const base = project.split(/[./]/).pop() || project;
+      setCrumbs([{ qn: project, name: base }]);
+      fetchGraph(project, project);
       setHighlightedIds(null);
       setSelectedPath(null);
+      setSelectedNode(null);
     }
-  }, [project, fetchOverview]);
-
-  const handleSelectPath = useCallback(
-    (path: string, nodeIds: Set<number>) => {
-      if (!filteredData || !path || nodeIds.size === 0) {
-        setHighlightedIds(null);
-        setSelectedPath(null);
-        setCameraTarget(null);
-        return;
-      }
-      setSelectedPath(path);
-      setHighlightedIds(nodeIds);
-      setCameraTarget(computeCameraTarget(filteredData.nodes, nodeIds));
-    },
-    [filteredData],
-  );
+  }, [project, fetchGraph]);
 
   const handleNodeClick = useCallback(
     (node: GraphNode) => {
-      if (!filteredData) return;
-      setSelectedNode(node);
+      if (!filteredData || !project) return;
 
-      /* Highlight the node and its direct connections */
+      /* Expandable container -> drill one level deeper. */
+      if (node.expandable && node.qn) {
+        const qn = node.qn;
+        setCrumbs((prev) => [...prev, { qn, name: node.name }]);
+        fetchGraph(project, qn);
+        setHighlightedIds(null);
+        setSelectedPath(null);
+        setSelectedNode(null);
+        setCameraTarget(null);
+        return;
+      }
+
+      /* Leaf -> select + highlight its direct connections. */
+      setSelectedNode(node);
       const connectedIds = new Set([node.id]);
       for (const edge of filteredData.edges) {
         if (edge.source === node.id) connectedIds.add(edge.target);
@@ -125,7 +136,23 @@ export function GraphTab({ project }: GraphTabProps) {
       setSelectedPath(node.file_path ?? null);
       setCameraTarget(computeCameraTarget(filteredData.nodes, connectedIds));
     },
-    [filteredData],
+    [filteredData, project, fetchGraph],
+  );
+
+  /* Jump to an ancestor in the breadcrumb path. */
+  const navigateToCrumb = useCallback(
+    (index: number) => {
+      if (!project) return;
+      const next = crumbs.slice(0, index + 1);
+      const target = next[next.length - 1];
+      setCrumbs(next);
+      fetchGraph(project, target.qn);
+      setHighlightedIds(null);
+      setSelectedPath(null);
+      setSelectedNode(null);
+      setCameraTarget(null);
+    },
+    [project, crumbs, fetchGraph],
   );
 
   const handleNavigateToNode = useCallback(
@@ -197,7 +224,11 @@ export function GraphTab({ project }: GraphTabProps) {
       <div className="flex items-center justify-center h-full">
         <div className="text-center p-8">
           <p className="text-red-400 text-sm mb-2">{error}</p>
-          <Button variant="outline" size="sm" onClick={() => fetchOverview(project)}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => fetchGraph(project, crumbs[crumbs.length - 1]?.qn ?? project)}
+          >
             Retry
           </Button>
         </div>
@@ -242,10 +273,10 @@ export function GraphTab({ project }: GraphTabProps) {
           onEnableAll={enableAll}
           onDisableAll={disableAll}
         />
-        <Sidebar
+        <LevelList
           nodes={filteredData.nodes}
-          onSelectPath={handleSelectPath}
-          selectedPath={selectedPath}
+          onPick={handleNodeClick}
+          selectedId={selectedNode?.id ?? null}
         />
       </div>
       <ResizeHandle
@@ -271,21 +302,38 @@ export function GraphTab({ project }: GraphTabProps) {
           />
         </ErrorBoundary>
 
+        {/* Breadcrumb drill path */}
+        <div className="absolute top-3 left-4 right-24 flex items-center gap-1 flex-wrap text-[11px] font-mono z-10">
+          {crumbs.map((c, i) => (
+            <span key={c.qn} className="flex items-center gap-1">
+              {i > 0 && <span className="text-white/20">/</span>}
+              <button
+                onClick={() => navigateToCrumb(i)}
+                disabled={i === crumbs.length - 1}
+                title={c.qn}
+                className={
+                  i === crumbs.length - 1
+                    ? "text-cyan-400 cursor-default"
+                    : "text-white/45 hover:text-white/80 transition-colors"
+                }
+              >
+                {c.name}
+              </button>
+            </span>
+          ))}
+        </div>
+
         {/* HUD */}
-        <div className="absolute top-4 left-4 text-[11px] text-white/30 pointer-events-none font-mono">
+        <div className="absolute top-10 left-4 text-[11px] text-white/30 pointer-events-none font-mono">
           <p>
-            {filteredData.nodes.length.toLocaleString()} nodes /{" "}
-            {filteredData.edges.length.toLocaleString()} edges
+            {filteredData.nodes.length.toLocaleString()} groups /{" "}
+            {filteredData.edges.length.toLocaleString()} links
           </p>
-          {data.nodes.length > filteredData.nodes.length && (
-            <p className="text-white/25 mt-0.5">
-              filtered from {data.nodes.length.toLocaleString()}
-            </p>
-          )}
+          <p className="text-white/25 mt-0.5">
+            click a node to drill in - size = code volume
+          </p>
           {highlightedIds && highlightedIds.size > 0 && (
-            <p className="text-cyan-400/50 mt-0.5">
-              {highlightedIds.size} selected
-            </p>
+            <p className="text-cyan-400/50 mt-0.5">{highlightedIds.size} selected</p>
           )}
         </div>
 
@@ -311,7 +359,7 @@ export function GraphTab({ project }: GraphTabProps) {
               setSelectedPath(null);
               setSelectedNode(null);
               setCameraTarget(null);
-              fetchOverview(project);
+              fetchGraph(project, crumbs[crumbs.length - 1]?.qn ?? project);
             }}
           >
             Refresh

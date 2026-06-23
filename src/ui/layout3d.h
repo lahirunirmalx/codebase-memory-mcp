@@ -54,10 +54,11 @@ typedef enum {
 /* Compute layout for a project.
  * center_node: QN of center (for detail level), NULL for overview
  * radius: hop distance from center (for detail level)
- * max_nodes: cap on returned nodes */
+ * max_nodes: cap on returned nodes
+ * label: restrict to a single node label (e.g. "Class"), or NULL for all labels */
 cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                                         cbm_layout_level_t level, const char *center_node,
-                                        int radius, int max_nodes);
+                                        int radius, int max_nodes, const char *label);
 
 /* Free a layout result. */
 void cbm_layout_free(cbm_layout_result_t *result);

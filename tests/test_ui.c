@@ -203,7 +203,7 @@ TEST(layout_empty_graph) {
 
     /* No nodes in store → empty result */
     cbm_layout_result_t *r =
-        cbm_layout_compute(store, "test-project", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+        cbm_layout_compute(store, "test-project", CBM_LAYOUT_OVERVIEW, NULL, 0, 100, NULL);
     ASSERT_NOT_NULL(r);
     ASSERT_EQ(r->node_count, 0);
     ASSERT_EQ(r->edge_count, 0);
@@ -230,7 +230,8 @@ TEST(layout_single_node) {
     int64_t id = cbm_store_upsert_node(store, &node);
     ASSERT_GT(id, 0);
 
-    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    cbm_layout_result_t *r =
+        cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100, NULL);
     ASSERT_NOT_NULL(r);
     ASSERT_EQ(r->node_count, 1);
     ASSERT_STR_EQ(r->nodes[0].name, "main");
@@ -267,7 +268,8 @@ TEST(layout_two_connected) {
     cbm_edge_t edge = {.project = "test", .source_id = id1, .target_id = id2, .type = "CALLS"};
     cbm_store_insert_edge(store, &edge);
 
-    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    cbm_layout_result_t *r =
+        cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100, NULL);
     ASSERT_NOT_NULL(r);
     ASSERT_EQ(r->node_count, 2);
 
@@ -307,7 +309,8 @@ TEST(layout_respects_max_nodes) {
     }
 
     /* max_nodes=5 should return at most 5 */
-    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 5);
+    cbm_layout_result_t *r =
+        cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 5, NULL);
     ASSERT_NOT_NULL(r);
     ASSERT_LTE(r->node_count, 5);
     ASSERT_EQ(r->total_nodes, 20);
@@ -341,8 +344,10 @@ TEST(layout_deterministic) {
     cbm_store_upsert_node(store, &n2);
 
     /* Run twice, check positions match */
-    cbm_layout_result_t *r1 = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
-    cbm_layout_result_t *r2 = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    cbm_layout_result_t *r1 =
+        cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100, NULL);
+    cbm_layout_result_t *r2 =
+        cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100, NULL);
     ASSERT_NOT_NULL(r1);
     ASSERT_NOT_NULL(r2);
     ASSERT_EQ(r1->node_count, r2->node_count);
@@ -374,7 +379,8 @@ TEST(layout_to_json) {
                     .end_line = 5};
     cbm_store_upsert_node(store, &n);
 
-    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    cbm_layout_result_t *r =
+        cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100, NULL);
     ASSERT_NOT_NULL(r);
 
     char *json = cbm_layout_to_json(r);
@@ -395,12 +401,13 @@ TEST(layout_to_json) {
 
 TEST(layout_null_inputs) {
     /* NULL store → NULL result */
-    cbm_layout_result_t *r = cbm_layout_compute(NULL, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    cbm_layout_result_t *r =
+        cbm_layout_compute(NULL, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100, NULL);
     ASSERT_NULL(r);
 
     /* NULL project → NULL result */
     cbm_store_t *store = cbm_store_open_memory();
-    r = cbm_layout_compute(store, NULL, CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    r = cbm_layout_compute(store, NULL, CBM_LAYOUT_OVERVIEW, NULL, 0, 100, NULL);
     ASSERT_NULL(r);
 
     /* cbm_layout_free(NULL) should not crash */
@@ -411,6 +418,72 @@ TEST(layout_null_inputs) {
     ASSERT_NULL(json);
 
     cbm_store_close(store);
+    PASS();
+}
+
+/* ── Hierarchy expansion (drill-down explorer) ────────────────── */
+
+TEST(expand_tree_groups_and_aggregates) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+
+    /* Hierarchy under "test": two folders with children + a leaf module.
+     * QNs use '.' separators, matching the real indexer's scheme. */
+    cbm_node_t nodes[] = {
+        {.project = "test", .label = "Folder", .name = "alpha", .qualified_name = "test.alpha"},
+        {.project = "test", .label = "Method", .name = "x", .qualified_name = "test.alpha.x"},
+        {.project = "test", .label = "Method", .name = "y", .qualified_name = "test.alpha.y"},
+        {.project = "test", .label = "Folder", .name = "beta", .qualified_name = "test.beta"},
+        {.project = "test", .label = "Method", .name = "z", .qualified_name = "test.beta.z"},
+        {.project = "test", .label = "Module", .name = "gamma", .qualified_name = "test.gamma"},
+    };
+    int64_t ids[6];
+    for (int i = 0; i < 6; i++) {
+        ids[i] = cbm_store_upsert_node(store, &nodes[i]);
+    }
+    /* Cross-folder call alpha.x -> beta.z should aggregate to a super-edge. */
+    cbm_edge_t e = {.project = "test", .source_id = ids[1], .target_id = ids[4], .type = "CALLS"};
+    cbm_store_insert_edge(store, &e);
+
+    cbm_tree_view_t v;
+    ASSERT_EQ(cbm_store_expand_tree(store, "test", "test", 500, 2000, &v), CBM_STORE_OK);
+
+    /* Three top-level groups: alpha (3 nodes), beta (2), gamma (1, leaf). */
+    ASSERT_EQ(v.child_count, 3);
+    int ai = -1, bi = -1, gi = -1;
+    for (int i = 0; i < v.child_count; i++) {
+        if (strcmp(v.children[i].name, "alpha") == 0)
+            ai = i;
+        else if (strcmp(v.children[i].name, "beta") == 0)
+            bi = i;
+        else if (strcmp(v.children[i].name, "gamma") == 0)
+            gi = i;
+    }
+    ASSERT_GTE(ai, 0);
+    ASSERT_GTE(bi, 0);
+    ASSERT_GTE(gi, 0);
+    ASSERT_EQ(v.children[ai].count, 3);
+    ASSERT_TRUE(v.children[ai].expandable);
+    ASSERT_EQ(v.children[bi].count, 2);
+    ASSERT_EQ(v.children[gi].count, 1);
+    ASSERT_FALSE(v.children[gi].expandable); /* single leaf, nothing to drill into */
+
+    /* Exactly one aggregated super-edge: alpha -> beta, weight 1. */
+    ASSERT_EQ(v.edge_count, 1);
+    ASSERT_EQ(v.edges[0].src, ai);
+    ASSERT_EQ(v.edges[0].dst, bi);
+    ASSERT_EQ(v.edges[0].weight, 1);
+
+    cbm_tree_view_free(&v);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(expand_tree_null_inputs) {
+    cbm_tree_view_t v;
+    ASSERT_EQ(cbm_store_expand_tree(NULL, "test", "test", 0, 0, &v), CBM_STORE_ERR);
+    cbm_tree_view_free(NULL); /* must not crash */
     PASS();
 }
 
@@ -436,4 +509,8 @@ SUITE(ui) {
     RUN_TEST(layout_deterministic);
     RUN_TEST(layout_to_json);
     RUN_TEST(layout_null_inputs);
+
+    /* Hierarchy expansion */
+    RUN_TEST(expand_tree_groups_and_aggregates);
+    RUN_TEST(expand_tree_null_inputs);
 }

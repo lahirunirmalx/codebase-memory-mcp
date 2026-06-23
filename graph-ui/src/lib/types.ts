@@ -10,12 +10,17 @@ export interface GraphNode {
   file_path?: string;
   size: number;
   color: string;
+  /* Drill-down explorer (aggregated container nodes from /api/graph): */
+  count?: number; /* number of code symbols in this subtree */
+  expandable?: boolean; /* can be drilled into */
+  qn?: string; /* full qualified_name; pass as the next `parent` to drill in */
 }
 
 export interface GraphEdge {
   source: number;
   target: number;
   type: string;
+  weight?: number; /* aggregated super-edge weight (drill-down explorer) */
 }
 
 export interface LinkedProject {
@@ -31,6 +36,7 @@ export interface GraphData {
   edges: GraphEdge[];
   total_nodes: number;
   linked_projects?: LinkedProject[];
+  prefix?: string; /* current container QN (drill-down explorer) */
 }
 
 export interface Project {

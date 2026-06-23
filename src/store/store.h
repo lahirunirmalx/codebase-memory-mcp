@@ -104,15 +104,16 @@ int cbm_store_restore_from(cbm_store_t *dst, cbm_store_t *src);
 
 typedef struct {
     const char *project;
-    const char *label;        /* NULL = any label */
-    const char *name_pattern; /* regex on name, NULL = any */
-    const char *qn_pattern;   /* regex on qualified_name, NULL = any */
-    const char *file_pattern; /* glob on file_path, NULL = any */
-    const char *relationship; /* edge type filter, NULL = any */
-    const char *direction;    /* "inbound" / "outbound" / "any", NULL = any */
-    int min_degree;           /* -1 = no filter (default), 0+ = minimum */
-    int max_degree;           /* -1 = no filter (default), 0+ = maximum */
-    int limit;                /* 0 = default (10) */
+    const char *label;           /* NULL = any label */
+    const char **include_labels; /* NULL-terminated whitelist (label IN (...)); overrides `label` */
+    const char *name_pattern;    /* regex on name, NULL = any */
+    const char *qn_pattern;      /* regex on qualified_name, NULL = any */
+    const char *file_pattern;    /* glob on file_path, NULL = any */
+    const char *relationship;    /* edge type filter, NULL = any */
+    const char *direction;       /* "inbound" / "outbound" / "any", NULL = any */
+    int min_degree;              /* -1 = no filter (default), 0+ = minimum */
+    int max_degree;              /* -1 = no filter (default), 0+ = maximum */
+    int limit;                   /* 0 = default (10) */
     int offset;
     bool exclude_entry_points;
     bool include_connected;
@@ -379,6 +380,41 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
 /* Free a search output's allocated memory. */
 void cbm_store_search_free(cbm_search_output_t *out);
+
+/* ── Hierarchy expansion (semantic-zoom drill-down) ─────────────────
+ * Groups nodes one level below a qualified_name prefix by their next QN
+ * segment, and aggregates cross-group relationship edges into weighted
+ * super-edges. Lets the UI represent a 300k-node graph as a navigable tree
+ * of container super-nodes without ever materializing the whole graph. */
+typedef struct {
+    char *name;     /* child segment (the next QN token under the prefix) */
+    char *full_qn;  /* prefix + "." + name (pass back as the next prefix to drill in) */
+    char *kind;     /* label of the container/leaf node for this segment, or "Group" */
+    int count;      /* number of nodes in this subtree */
+    int expandable; /* 1 if the subtree has deeper nodes (can drill in) */
+} cbm_tree_child_t;
+
+typedef struct {
+    int src;    /* index into children[] */
+    int dst;    /* index into children[] */
+    int weight; /* number of underlying relationship edges crossing the boundary */
+} cbm_tree_edge_t;
+
+typedef struct {
+    cbm_tree_child_t *children;
+    int child_count;
+    cbm_tree_edge_t *edges;
+    int edge_count;
+} cbm_tree_view_t;
+
+/* Expand one hierarchy level under `prefix` (a node qualified_name, e.g. the
+ * project name for the root). Caps children at child_limit and edges at
+ * edge_limit. Returns CBM_STORE_OK and fills `out` (free with cbm_tree_view_free). */
+int cbm_store_expand_tree(cbm_store_t *s, const char *project, const char *prefix, int child_limit,
+                          int edge_limit, cbm_tree_view_t *out);
+
+/* Free a tree view's allocated memory. */
+void cbm_tree_view_free(cbm_tree_view_t *v);
 
 /* ── Traversal ──────────────────────────────────────────────────── */
 
